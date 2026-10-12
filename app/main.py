@@ -19,7 +19,11 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,
+    serverSelectionTimeoutMS=5000,
+)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -30,6 +34,30 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def to_ms(dt):
+    """Mongo datetime (UTC) -> epoch milliseconds (int). None stays None."""
+    if dt is None:
+        return None
+    return (dt - EPOCH) // timedelta(milliseconds=1)
+
+
+def from_ms(ms: int) -> datetime:
+    """epoch milliseconds (int) -> UTC datetime."""
+    return EPOCH + timedelta(milliseconds=ms)
+
+
+def employee_out(doc: dict) -> dict:
+    """Employee document -> API shape (no _id, created_at in ms)."""
+    doc = dict(doc)
+    doc.pop("_id", None)
+    doc["created_at"] = to_ms(doc.get("created_at"))
+    return doc
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     h, m = map(int, shift_start.split(":"))
     start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -71,6 +99,10 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        client.admin.command("ping")
+    except Exception:
+        raise HTTPException(503, "MongoDB unavailable")
     return {"status": "ok"}
 
 
@@ -96,9 +128,8 @@ def list_employees(
         q["department"] = department
     skip = (page - 1) * page_size
     total = db.employees.count_documents(q)
-    items = list(
-        db.employees.find(q, {"_id": 0}).sort("emp_code", 1).skip(skip).limit(page_size)
-    )
+    cursor = db.employees.find(q).sort("emp_code", 1).skip(skip).limit(page_size)
+    items = [employee_out(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
