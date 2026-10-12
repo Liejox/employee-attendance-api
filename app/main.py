@@ -9,13 +9,16 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -28,7 +31,18 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+def ensure_indexes():
+    """Create indexes at startup. create_index is idempotent (safe to run every time)."""
+    db.employees.create_index("emp_code", unique=True)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_indexes()
+    yield
+
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -78,14 +92,31 @@ def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field("09:30", pattern=HHMM)
+    shift_end: str = Field("18:30", pattern=HHMM)
     joined_on: str
+
+    @field_validator("joined_on")
+    @classmethod
+    def joined_on_is_a_real_date(cls, v: str) -> str:
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", v):
+            raise ValueError("joined_on must be YYYY-MM-DD")
+        datetime.strptime(v, "%Y-%m-%d")  # raises ValueError for 2026-02-30
+        return v
+
+    @model_validator(mode="after")
+    def shifts_must_differ(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start must differ from shift_end")
+        return self
 
 
 class PunchInIn(BaseModel):
@@ -108,13 +139,13 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(timezone.utc)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+    return employee_out(doc)
 
 
 @app.get("/employees")
