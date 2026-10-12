@@ -12,6 +12,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -72,21 +73,72 @@ def employee_out(doc: dict) -> dict:
     return doc
 
 
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def round_half_up(value, places: int = 2) -> float:
+    """Round half-up: 0.125 -> 0.13. Python's round() is banker's/float based."""
+    d = value if isinstance(value, Decimal) else Decimal(str(value))
+    return float(d.quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
+
+
+def trunc_seconds(dt: datetime) -> datetime:
+    """R1: drop microseconds, keep whole seconds."""
+    return dt.replace(microsecond=0)
+
+
+def parse_hhmm(value: str):
+    h, m = value.split(":")
+    return int(h), int(m)
+
+
+def is_overnight(shift_start: str, shift_end: str) -> bool:
+    return shift_end <= shift_start
+
+
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
+    """R1: IST calendar date of the punch-in; overnight early punch -> previous day."""
+    local = punch_in.astimezone(IST)
+    day = local.date()
+    if is_overnight(shift_start, shift_end):
+        eh, em = parse_hhmm(shift_end)
+        if (local.hour, local.minute) < (eh, em):
+            day -= timedelta(days=1)
+    return day.isoformat()
+
+
+def shift_bounds(date_str: str, shift_start: str, shift_end: str):
+    """IST start and end datetimes of the shift that belongs to attendance date."""
+    sh, sm = parse_hhmm(shift_start)
+    eh, em = parse_hhmm(shift_end)
+    day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=IST)
+    start = day.replace(hour=sh, minute=sm)
+    end = day.replace(hour=eh, minute=em)
+    if end <= start:
+        end += timedelta(days=1)
+    return start, end
+
+
+def compute_late_minutes(punch_in: datetime, date_str: str, shift_start: str, shift_end: str) -> int:
+    """R2: late only if strictly more than 10:00 after shift start; then floor minutes since start."""
+    start, _ = shift_bounds(date_str, shift_start, shift_end)
+    seconds = int((trunc_seconds(punch_in) - start).total_seconds())
+    return seconds // 60 if seconds > 600 else 0
+
+
+def compute_overtime(punch_out: datetime, date_str: str, shift_start: str, shift_end: str) -> int:
+    """R3: floor minutes after shift end, counted only when at least 30."""
+    _, end = shift_bounds(date_str, shift_start, shift_end)
+    minutes = int((trunc_seconds(punch_out) - end).total_seconds()) // 60
+    return minutes if minutes >= 30 else 0
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    """R4: seconds / 3600, 2 decimals half-up."""
+    seconds = int((trunc_seconds(punch_out) - trunc_seconds(punch_in)).total_seconds())
+    return round_half_up(Decimal(seconds) / Decimal(3600), 2)
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_half_day(work_hours) -> bool:
+    """R5: rounded work_hours < 4.50 (None when not punched out yet)."""
+    return work_hours is not None and work_hours < 4.50
 
 
 # --------------------------------------------------------------------------- #
