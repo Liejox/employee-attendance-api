@@ -13,7 +13,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -35,6 +35,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def ensure_indexes():
     """Create indexes at startup. create_index is idempotent (safe to run every time)."""
     db.employees.create_index("emp_code", unique=True)
+    db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
 
 
 @asynccontextmanager
@@ -140,11 +141,38 @@ def compute_half_day(work_hours) -> bool:
     """R5: rounded work_hours < 4.50 (None when not punched out yet)."""
     return work_hours is not None and work_hours < 4.50
 
+def history_out(entry: dict) -> dict:
+    """History entry: Mongo datetimes -> epoch ms (also inside changes.punch_in / punch_out)."""
+    changes = {}
+    for field, change in entry.get("changes", {}).items():
+        if field in ("punch_in", "punch_out"):
+            changes[field] = {"from": to_ms(change.get("from")), "to": to_ms(change.get("to"))}
+        else:
+            changes[field] = {"from": change.get("from"), "to": change.get("to")}
+    return {"at": to_ms(entry.get("at")), "by": entry.get("by"), "reason": entry.get("reason"), "changes": changes}
+
+
+def attendance_out(doc: dict) -> dict:
+    """Attendance document -> API shape. No _id, instants in ms, missing fields get defaults."""
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": to_ms(doc.get("punch_in")),
+        "punch_out": to_ms(doc.get("punch_out")),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": [history_out(h) for h in doc.get("history", [])],
+    }
+
 
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
+EpochMs = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
 
 
 class EmployeeIn(BaseModel):
@@ -173,8 +201,8 @@ class EmployeeIn(BaseModel):
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMs] = None
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
@@ -219,10 +247,11 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    now = datetime.now(timezone.utc)
+    ts = trunc_seconds(from_ms(body.punched_at) if body.punched_at is not None else now)
+    d = attendance_date(ts, emp["shift_start"], emp["shift_end"])
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -230,15 +259,16 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(ts, d, emp["shift_start"], emp["shift_end"]),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return attendance_out(doc)
 
 
 @app.get("/attendance")
