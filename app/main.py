@@ -405,6 +405,13 @@ def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeIn):
         raise HTTPException(404, "no attendance record for that date")
 
     new = regularized_state(rec, emp, body)
+    asked_change = (
+        (body.status is not None and body.status != rec["status"])
+        or (body.punch_in is not None and trunc_seconds(from_ms(body.punch_in)) != rec.get("punch_in"))
+        or (body.punch_out is not None and trunc_seconds(from_ms(body.punch_out)) != rec.get("punch_out"))
+    )
+    if not asked_change:
+        raise HTTPException(422, "the request changes nothing")
     old = {"status": rec["status"], "punch_in": rec.get("punch_in"), "punch_out": rec.get("punch_out"),
            "work_hours": rec.get("work_hours"), "late_minutes": rec.get("late_minutes", 0),
            "overtime_minutes": rec.get("overtime_minutes", 0), "half_day": rec.get("half_day", False)}
