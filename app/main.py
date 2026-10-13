@@ -17,8 +17,8 @@ from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field, field_validator, model_validator
-from pymongo import MongoClient
+from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
@@ -36,6 +36,7 @@ def ensure_indexes():
     """Create indexes at startup. create_index is idempotent (safe to run every time)."""
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
+    db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
 
 
 @asynccontextmanager
@@ -174,6 +175,16 @@ def attendance_out(doc: dict) -> dict:
 HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
 EpochMs = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
 
+def _valid_date(v: str) -> str:
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", v):
+        raise ValueError("must be YYYY-MM-DD")
+    datetime.strptime(v, "%Y-%m-%d")  # rejects 2026-02-30
+    return v
+
+
+DateStr = Annotated[str, AfterValidator(_valid_date)]
+Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+
 
 class EmployeeIn(BaseModel):
     emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
@@ -203,6 +214,10 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMs] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -271,17 +286,42 @@ def punch_in(body: PunchInIn):
     return attendance_out(doc)
 
 
-@app.get("/attendance")
-def list_attendance(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-):
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = trunc_seconds(from_ms(body.punched_at) if body.punched_at is not None else datetime.now(timezone.utc))
+    rec = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", -1)]
+    )
+    if rec is None:
+        raise HTTPException(404, "no punch-in found")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, "already punched out")
+    punch_in_ts = trunc_seconds(rec["punch_in"])
+    if ts <= punch_in_ts or ts > punch_in_ts + timedelta(hours=24):
+        raise HTTPException(422, "punched_at must be after punch_in and within 24 hours")
+    work_hours = compute_work_hours(punch_in_ts, ts)
+    updated = db.attendance_logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": {
+            "punch_out": ts,
+            "work_hours": work_hours,
+            "overtime_minutes": compute_overtime(ts, rec["date"], emp["shift_start"], emp["shift_end"]),
+            "half_day": compute_half_day(work_hours),
+        }},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "already punched out")
+    return attendance_out(updated)
+
+
+def attendance_filter(emp_code, date_from, date_to, status) -> dict:
+    """Builds the Mongo filter for GET /attendance (the explain endpoint reuses this)."""
     q = {}
-    if emp_code:
+    if emp_code is not None:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
@@ -289,15 +329,31 @@ def list_attendance(
             q["date"]["$gte"] = date_from
         if date_to:
             q["date"]["$lte"] = date_to
-    if status:
+    if status is not None:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    return q
+
+
+@app.get("/attendance")
+def list_attendance(
+    emp_code: Optional[str] = None,
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(422, "date_from must not be after date_to")
+    q = attendance_filter(emp_code, date_from, date_to, status)
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q)
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    return {"items": [attendance_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
 # --------------------------------------------------------------------------- #
