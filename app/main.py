@@ -219,6 +219,13 @@ class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMs] = None
 
+class RegularizeIn(BaseModel):
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMs] = None
+    punch_out: Optional[EpochMs] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
@@ -354,6 +361,71 @@ def list_attendance(
         .limit(page_size)
     )
     return {"items": [attendance_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+
+
+def regularized_state(rec: dict, emp: dict, body: RegularizeIn) -> dict:
+    """Final values of the 7 correctable/derived fields after applying the request (R1-R5). 422 on rule breaks."""
+    status = body.status or rec["status"]
+    asked_in = trunc_seconds(from_ms(body.punch_in)) if body.punch_in is not None else None
+    asked_out = trunc_seconds(from_ms(body.punch_out)) if body.punch_out is not None else None
+    if status in ("ABSENT", "LEAVE"):
+        if asked_in is not None or asked_out is not None:
+            raise HTTPException(422, "ABSENT/LEAVE clear the punch times; do not send punch_in/punch_out")
+        return {"status": status, "punch_in": None, "punch_out": None, "work_hours": None,
+                "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    punch_in = asked_in if asked_in is not None else rec.get("punch_in")
+    punch_out = asked_out if asked_out is not None else rec.get("punch_out")
+    if punch_in is None:
+        raise HTTPException(422, "a presence status needs a punch_in")
+    ss, se = emp["shift_start"], emp["shift_end"]
+    if asked_in is not None and attendance_date(asked_in, ss, se) != rec["date"]:
+        raise HTTPException(422, "punch_in must stay on the record's attendance date")
+    if punch_out is not None and (asked_in is not None or asked_out is not None):
+        pi = trunc_seconds(punch_in)
+        if punch_out <= pi or punch_out > pi + timedelta(hours=24):
+            raise HTTPException(422, "punch_out must be after punch_in and within 24 hours")
+    late = compute_late_minutes(punch_in, rec["date"], ss, se)
+    if punch_out is None:
+        work_hours, overtime, half_day = None, 0, False
+    else:
+        work_hours = compute_work_hours(punch_in, punch_out)
+        overtime = compute_overtime(punch_out, rec["date"], ss, se)
+        half_day = compute_half_day(work_hours)
+    return {"status": status, "punch_in": punch_in, "punch_out": punch_out, "work_hours": work_hours,
+            "late_minutes": late, "overtime_minutes": overtime, "half_day": half_day}
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+    if rec is None:
+        raise HTTPException(404, "no attendance record for that date")
+
+    new = regularized_state(rec, emp, body)
+    old = {"status": rec["status"], "punch_in": rec.get("punch_in"), "punch_out": rec.get("punch_out"),
+           "work_hours": rec.get("work_hours"), "late_minutes": rec.get("late_minutes", 0),
+           "overtime_minutes": rec.get("overtime_minutes", 0), "half_day": rec.get("half_day", False)}
+    changes = {k: {"from": old[k], "to": new[k]} for k in new if old[k] != new[k]}
+    if not changes:
+        raise HTTPException(422, "the request changes nothing")
+
+    entry = {"at": datetime.now(timezone.utc), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    # Optimistic lock: the update only applies if the record is still exactly as we read it.
+    guard = {"_id": rec["_id"], "status": old["status"], "punch_in": old["punch_in"], "punch_out": old["punch_out"]}
+    history = rec.get("history")
+    if isinstance(history, list):
+        guard["history"] = {"$size": len(history)}
+        update = {"$set": new, "$push": {"history": entry}}
+    else:
+        guard["history"] = None
+        update = {"$set": {**new, "history": [entry]}}
+    updated = db.attendance_logs.find_one_and_update(guard, update, return_document=ReturnDocument.AFTER)
+    if updated is None:
+        raise HTTPException(409, "record was changed by someone else; reload and retry")
+    return attendance_out(updated)
 
 
 # --------------------------------------------------------------------------- #
