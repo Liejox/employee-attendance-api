@@ -435,6 +435,66 @@ def regularize_attendance(emp_code: str, date: DateStr, body: RegularizeIn):
     return attendance_out(updated)
 
 
+MONTH_RE = r"^[0-9]{4}-(0[1-9]|1[0-2])$"
+PRESENT_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+
+
+def month_bounds(month: str):
+    y, m = int(month[:4]), int(month[5:])
+    if y < 1:
+        raise HTTPException(422, "invalid month")
+    first = datetime(y, m, 1).date()
+    nxt = datetime(y + (m == 12), m % 12 + 1, 1).date()
+    return first, nxt
+
+
+def working_days(first, nxt, joined_on: str) -> int:
+    day = max(first, datetime.strptime(joined_on, "%Y-%m-%d").date())
+    n = 0
+    while day < nxt:
+        if day.weekday() < 5:
+            n += 1
+        day += timedelta(days=1)
+    return n
+
+
+def employee_monthly_pipeline(emp_code: str, first, nxt) -> list:
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first.isoformat(), "$lt": nxt.isoformat()}}},
+        {"$addFields": {
+            "weekday": {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}, 5]},
+            "present": {"$in": ["$status", PRESENT_STATUSES]},
+            "late": {"$ifNull": ["$late_minutes", 0]},
+            "overtime": {"$ifNull": ["$overtime_minutes", 0]},
+            "half": {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
+        }},
+        {"$group": {"_id": None,
+            "present_days": {"$sum": {"$cond": [{"$and": ["$present", "$weekday"]}, {"$cond": ["$half", 0.5, 1]}, 0]}},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late", 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": "$late"},
+            "total_overtime_minutes": {"$sum": "$overtime"}}},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_RE)):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    first, nxt = month_bounds(month)
+    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, first, nxt)))
+    row = rows[0] if rows else {}
+    days = working_days(first, nxt, emp["joined_on"])
+    present = Decimal(str(row.get("present_days", 0)))
+    return {"emp_code": emp_code, "month": month, "working_days": days,
+            "present_days": round_half_up(present, 2),
+            "leave_days": int(row.get("leave_days", 0)), "late_count": int(row.get("late_count", 0)),
+            "total_late_minutes": int(row.get("total_late_minutes", 0)),
+            "total_overtime_minutes": int(row.get("total_overtime_minutes", 0)),
+            "attendance_pct": round_half_up(present / Decimal(days) * 100, 2) if days else None}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
