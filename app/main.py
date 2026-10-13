@@ -495,6 +495,66 @@ def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_RE)):
             "attendance_pct": round_half_up(present / Decimal(days) * 100, 2) if days else None}
 
 
+def department_summary_pipeline(first, nxt, department: Optional[str]) -> list:
+    pipeline = [
+        {"$match": {"date": {"$gte": first.isoformat(), "$lt": nxt.isoformat()}}},
+        {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline += [
+        {"$addFields": {
+            "weekday": {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}, 5]},
+            "present": {"$in": ["$status", PRESENT_STATUSES]},
+            "late": {"$ifNull": ["$late_minutes", 0]},
+            "half": {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
+            "has_hours": {"$isNumber": "$work_hours"},
+        }},
+        {"$group": {
+            "_id": "$emp.department",
+            "present_days": {"$sum": {"$cond": [{"$and": ["$present", "$weekday"]}, {"$cond": ["$half", 0.5, 1]}, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": ["$late", 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": "$late"},
+            "leave_count": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$status", "ON_DUTY"]}, 1, 0]}},
+            "hours_n": {"$sum": {"$cond": [{"$and": ["$present", "$has_hours"]}, 1, 0]}},
+            "hours_cs": {"$sum": {"$cond": [{"$and": ["$present", "$has_hours"]}, {"$round": [{"$multiply": ["$work_hours", 100]}, 0]}, 0]}},
+        }},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str = Query(pattern=MONTH_RE), department: Optional[str] = None):
+    first, nxt = month_bounds(month)
+    last_day = (nxt - timedelta(days=1)).isoformat()
+    head_match = {"joined_on": {"$lte": last_day}}
+    if department is not None:
+        head_match["department"] = department
+    headcount = {r["_id"]: r["n"] for r in db.employees.aggregate(
+        [{"$match": head_match}, {"$group": {"_id": "$department", "n": {"$sum": 1}}}])}
+    stats = {r["_id"]: r for r in db.attendance_logs.aggregate(department_summary_pipeline(first, nxt, department))}
+    items = []
+    for dept in sorted(headcount):
+        s = stats.get(dept, {})
+        n = int(s.get("hours_n", 0))
+        avg = None
+        if n:
+            avg = round_half_up(Decimal(int(s["hours_cs"])) / Decimal(n) / 100, 2)
+        items.append({
+            "department": dept,
+            "headcount": headcount[dept],
+            "present_days": round_half_up(Decimal(str(s.get("present_days", 0))), 2),
+            "avg_work_hours": avg,
+            "late_count": int(s.get("late_count", 0)),
+            "total_late_minutes": int(s.get("total_late_minutes", 0)),
+            "leave_count": int(s.get("leave_count", 0)),
+            "on_duty_count": int(s.get("on_duty_count", 0)),
+        })
+    return {"month": month, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
