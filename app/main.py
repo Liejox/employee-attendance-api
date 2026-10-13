@@ -555,6 +555,40 @@ def department_summary(month: str = Query(pattern=MONTH_RE), department: Optiona
     return {"month": month, "items": items}
 
 
+def late_leaderboard_pipeline(first, nxt, department: Optional[str], limit: int) -> list:
+    pipeline = [
+        {"$match": {"date": {"$gte": first.isoformat(), "$lt": nxt.isoformat()}}},
+        {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
+    ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline += [
+        {"$group": {
+            "_id": "$emp_code",
+            "name": {"$first": "$emp.name"},
+            "department": {"$first": "$emp.department"},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(month: str = Query(pattern=MONTH_RE), limit: int = Query(10, ge=1, le=50), department: Optional[str] = None):
+    first, nxt = month_bounds(month)
+    rows = db.attendance_logs.aggregate(late_leaderboard_pipeline(first, nxt, department, limit))
+    return {"month": month, "items": [
+        {"rank": int(r["rank"]), "emp_code": r["_id"], "name": r["name"], "department": r["department"],
+         "total_late_minutes": int(r["total_late_minutes"]), "late_count": int(r["late_count"])}
+        for r in rows]}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
