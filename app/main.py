@@ -499,14 +499,10 @@ def employee_monthly(emp_code: str, month: str = Query(pattern=MONTH_RE)):
 
 
 def department_summary_pipeline(first, nxt, department: Optional[str]) -> list:
+    # Per-employee totals first (index range scan on date), THEN join employees: 500 lookups instead of one per log row.
+    sums = ["present_days", "late_count", "total_late_minutes", "leave_count", "on_duty_count", "hours_n", "hours_cs"]
     pipeline = [
         {"$match": {"date": {"$gte": first.isoformat(), "$lt": nxt.isoformat()}}},
-        {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "emp"}},
-        {"$unwind": "$emp"},
-    ]
-    if department is not None:
-        pipeline.append({"$match": {"emp.department": department}})
-    pipeline += [
         {"$addFields": {
             "weekday": {"$lte": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}, 5]},
             "present": {"$in": ["$status", PRESENT_STATUSES]},
@@ -515,7 +511,7 @@ def department_summary_pipeline(first, nxt, department: Optional[str]) -> list:
             "has_hours": {"$isNumber": "$work_hours"},
         }},
         {"$group": {
-            "_id": "$emp.department",
+            "_id": "$emp_code",
             "present_days": {"$sum": {"$cond": [{"$and": ["$present", "$weekday"]}, {"$cond": ["$half", 0.5, 1]}, 0]}},
             "late_count": {"$sum": {"$cond": [{"$gt": ["$late", 0]}, 1, 0]}},
             "total_late_minutes": {"$sum": "$late"},
@@ -524,7 +520,12 @@ def department_summary_pipeline(first, nxt, department: Optional[str]) -> list:
             "hours_n": {"$sum": {"$cond": [{"$and": ["$present", "$has_hours"]}, 1, 0]}},
             "hours_cs": {"$sum": {"$cond": [{"$and": ["$present", "$has_hours"]}, {"$round": [{"$multiply": ["$work_hours", 100]}, 0]}, 0]}},
         }},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
     ]
+    if department is not None:
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline.append({"$group": {"_id": "$emp.department", **{k: {"$sum": "$" + k} for k in sums}}})
     return pipeline
 
 
@@ -561,20 +562,19 @@ def department_summary(month: str = Query(pattern=MONTH_RE), department: Optiona
 def late_leaderboard_pipeline(first, nxt, department: Optional[str], limit: int) -> list:
     pipeline = [
         {"$match": {"date": {"$gte": first.isoformat(), "$lt": nxt.isoformat()}}},
-        {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "emp"}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {"from": "employees", "localField": "_id", "foreignField": "emp_code", "as": "emp"}},
         {"$unwind": "$emp"},
     ]
     if department is not None:
         pipeline.append({"$match": {"emp.department": department}})
     pipeline += [
-        {"$group": {
-            "_id": "$emp_code",
-            "name": {"$first": "$emp.name"},
-            "department": {"$first": "$emp.department"},
-            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
-            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
-        }},
-        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$addFields": {"name": "$emp.name", "department": "$emp.department"}},
         {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
         {"$match": {"rank": {"$lte": limit}}},
         {"$sort": {"total_late_minutes": -1, "_id": 1}},
