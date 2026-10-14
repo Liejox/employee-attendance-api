@@ -8,6 +8,7 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import json
 import os
 import re
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Annotated, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, field_validator, model_validator
@@ -37,6 +39,7 @@ def ensure_indexes():
     db.employees.create_index("emp_code", unique=True)
     db.attendance_logs.create_index([("emp_code", 1), ("date", 1)], unique=True)
     db.attendance_logs.create_index([("date", -1), ("emp_code", 1)])
+    db.employees.create_index([("department", 1), ("joined_on", 1)])
 
 
 @asynccontextmanager
@@ -653,6 +656,71 @@ def department_trend(department: str, date_from: Annotated[DateStr, Query(alias=
         })
     return {"department": department, "items": items}
 
+
+EXPLAIN_ENDPOINTS = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def require_params(**params):
+    missing = [name for name, value in params.items() if value is None]
+    if missing:
+        raise HTTPException(422, "missing query parameter(s): " + ", ".join(missing))
+
+
+def aggregate_command(pipeline: list) -> dict:
+    return {"aggregate": "attendance_logs", "pipeline": pipeline, "cursor": {}}
+
+
+def run_explain(command: dict) -> dict:
+    result = db.command({"explain": command, "verbosity": "executionStats"})
+    return json.loads(json_util.dumps(result, json_options=json_util.RELAXED_JSON_OPTIONS))
+
+
+@app.get("/admin/explain/{endpoint}")
+def admin_explain(
+    endpoint: EXPLAIN_ENDPOINTS,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_RE),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[DateStr] = None,
+    date_to: Optional[DateStr] = None,
+    status: Optional[Status] = None,
+    trend_from: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    trend_to: Annotated[Optional[DateStr], Query(alias="to")] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if endpoint == "attendance_list":
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from must not be after date_to")
+        command = {"find": "attendance_logs", "filter": attendance_filter(emp_code, date_from, date_to, status),
+                   "sort": {"date": -1, "emp_code": 1}, "skip": (page - 1) * page_size, "limit": page_size}
+    elif endpoint == "employee_monthly":
+        require_params(emp_code=emp_code, month=month)
+        first, nxt = month_bounds(month)
+        command = aggregate_command(employee_monthly_pipeline(emp_code, first, nxt))
+    elif endpoint == "department_summary":
+        require_params(month=month)
+        first, nxt = month_bounds(month)
+        command = aggregate_command(department_summary_pipeline(first, nxt, department))
+    elif endpoint == "late_leaderboard":
+        require_params(month=month)
+        first, nxt = month_bounds(month)
+        command = aggregate_command(late_leaderboard_pipeline(first, nxt, department, limit))
+    else:
+        require_params(department=department, **{"from": trend_from, "to": trend_to})
+        first = datetime.strptime(trend_from, "%Y-%m-%d").date()
+        last = datetime.strptime(trend_to, "%Y-%m-%d").date()
+        if last < first:
+            raise HTTPException(422, "'to' must not be before 'from'")
+        if (last - first).days + 1 > 92:
+            raise HTTPException(422, "range must not exceed 92 days")
+        emps = list(db.employees.find({"department": department}, {"emp_code": 1, "joined_on": 1}))
+        if not emps:
+            raise HTTPException(404, "department not found")
+        command = aggregate_command(department_trend_pipeline(
+            [e["emp_code"] for e in emps], [e["joined_on"] for e in emps], first, last))
+    return {"endpoint": endpoint, "collection": "attendance_logs", "explain": run_explain(command)}
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
