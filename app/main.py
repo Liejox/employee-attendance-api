@@ -589,6 +589,71 @@ def late_leaderboard(month: str = Query(pattern=MONTH_RE), limit: int = Query(10
         for r in rows]}
 
 
+def department_trend_pipeline(emp_codes: list, joined_list: list, first, last) -> list:
+    start = datetime(first.year, first.month, first.day, tzinfo=timezone.utc)
+    stop = datetime(last.year, last.month, last.day, tzinfo=timezone.utc) + timedelta(days=1)
+    return [
+        {"$match": {"date": {"$gte": first.isoformat(), "$lte": last.isoformat()}, "emp_code": {"$in": emp_codes}}},
+        {"$group": {
+            "_id": "$date",
+            "present": {"$sum": {"$cond": [{"$in": ["$status", PRESENT_STATUSES]},
+                                           {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]}, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$addFields": {"d": {"$dateFromString": {"dateString": "$_id", "format": "%Y-%m-%d"}}}},
+        {"$densify": {"field": "d", "range": {"step": 1, "unit": "day", "bounds": [start, stop]}}},
+        {"$match": {"d": {"$lt": stop}}},
+        {"$addFields": {
+            "date": {"$dateToString": {"date": "$d", "format": "%Y-%m-%d"}},
+            "present": {"$ifNull": ["$present", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+            "is_working_day": {"$lte": [{"$isoDayOfWeek": "$d"}, 5]},
+        }},
+        {"$addFields": {"headcount": {"$size": {"$filter": {"input": joined_list, "cond": {"$lte": ["$$this", "$date"]}}}}}},
+        {"$addFields": {"rate_bp": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            {"$floor": {"$add": [{"$divide": [{"$multiply": ["$present", 10000]}, "$headcount"]}, 0.5]}},
+            None]}}},
+        {"$addFields": {"has_rate": {"$cond": [{"$eq": ["$rate_bp", None]}, 0, 1]}}},
+        {"$setWindowFields": {
+            "sortBy": {"d": 1},
+            "output": {
+                "win_sum": {"$sum": "$rate_bp", "window": {"documents": [-6, 0]}},
+                "win_n": {"$sum": "$has_rate", "window": {"documents": [-6, 0]}},
+            }}},
+        {"$sort": {"d": 1}},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, date_from: Annotated[DateStr, Query(alias="from")], date_to: Annotated[DateStr, Query(alias="to")]):
+    first = datetime.strptime(date_from, "%Y-%m-%d").date()
+    last = datetime.strptime(date_to, "%Y-%m-%d").date()
+    if last < first:
+        raise HTTPException(422, "'to' must not be before 'from'")
+    if (last - first).days + 1 > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+    emps = list(db.employees.find({"department": department}, {"emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, "department not found")
+    pipeline = department_trend_pipeline([e["emp_code"] for e in emps], [e["joined_on"] for e in emps], first, last)
+    items = []
+    for r in db.attendance_logs.aggregate(pipeline):
+        rate = None if r["rate_bp"] is None else round_half_up(Decimal(int(r["rate_bp"])) / 10000, 4)
+        n = int(r["win_n"])
+        moving = None if n == 0 else round_half_up(Decimal(int(r["win_sum"])) / Decimal(n) / 10000, 4)
+        items.append({
+            "date": r["date"],
+            "is_working_day": bool(r["is_working_day"]),
+            "headcount": int(r["headcount"]),
+            "present_count": round_half_up(Decimal(str(r["present"])), 2),
+            "late_count": int(r["late_count"]),
+            "attendance_rate": rate,
+            "moving_avg_7d": moving,
+        })
+    return {"department": department, "items": items}
+
+
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
 #   POST  /attendance/punch-out
